@@ -1,15 +1,22 @@
 # ===== Clash / mihomo 通用节点模板（VPS 可迁移）=====
-# 能力与原订阅配置一致：fake-ip DNS、v4/v6 双栈 × Hysteria2/Reality 共四节点、
-# url-test 测速池、fallback 故障转移、select 手动入口、广告拦截与国内直连分流。
+# 能力与原订阅配置一致：
+#   fake-ip DNS + respect-rules（DNS 查询本身受路由规则判决）、
+#   v4/v6 双栈 × Reality/Hysteria2 共四节点、
+#   v4 组与 v6 组各自 Reality→Hy2 的 fallback、顶层 select（默认 v6 组）、
+#   广告拦截、内网/直连域名与 GEOIP,CN 分流、MATCH 兜底。
 #
-# 迁移 VPS 时只需要改 proxies 里带 "←" 的行（锚点定义，后三个节点用 *锚点名 引用）：
-#   server_v4 / server_v6           新的 VPS 地址
-#   port_hy2 / port_reality         新的入站端口
-#   hy2_password / vless_uuid       新的凭据
-#   reality_public_key / short_id   新的 Reality 密钥
-#   sni_hy2 / sni_reality           新的伪装域名
-# 以及 rules 开头两条 IP-CIDR / IP-CIDR6：同步成新的 VPS 地址。
-# VPS 只有 IPv4 时，删掉两个 v6 节点（name 为 VPS-v6-*）及 proxy-groups 中对它们的引用。
+# 迁移 VPS 时只需要改以下位置，其余任何一行都不用动：
+#   proxies 中带 "←" 的行（锚点定义，其余节点用 *锚点名 引用，改一次全同步）
+#     server_v4 / server_v6           新的 VPS 地址
+#     port_reality / port_hy2         新的入站端口
+#     vless_uuid / hy2_password       新的凭据
+#     reality_public_key / reality_short_id   新的 Reality 密钥
+#     sni_reality / sni_hy2           新的伪装域名
+#   geox-url.mmdb                     自托管 geoip 镜像地址
+#   rules 开头两条 IP-CIDR / IP-CIDR6  同步成新的 VPS 地址
+# VPS 只有 IPv4 时：删掉两个 v6 节点、整个「🔁 v6(Reality 优先)」组，
+# 以及「🚀 节点选择」里对它的引用；并把 default-selected 改为 v4 组。
+# 节点全是字面 IP 时用不到 proxy-server-nameserver，换域名节点时无需改结构。
 
 mixed-port: 7890
 allow-lan: false
@@ -25,77 +32,137 @@ profile:
   store-selected: true
   store-fake-ip: true
 
+geox-url:
+  # 自托管 geodata 镜像（MetaCubeX/meta-rules-dat@release/geoip.metadb，
+  # 由本机 nginx 提供，见 /var/www/secure/<token>/rules/），
+  # 避免大陆客户端拉不到 jsdelivr 时 GEOIP,CN 直接失效。
+  # 注意：不再自托管 geosite —— 本配置已不用 geosite 做任何判决。
+  mmdb: "https://198.51.100.10.2001-db8--10.sslip.io:8443/CHANGE_ME_TOKEN/rules/geoip.metadb"
+  # ↑ 自托管 geoip.metadb 的地址（迁移 VPS 时改这里）。域名格式为
+  #   <IPv4 原样>.<IPv6 把 ":" 换成 "-">.sslip.io，token 路径由服务端 nginx 决定；
+  #   不自托管就整体删掉 geox-url 段，mihomo 会用内置默认地址。
+
 dns:
+  # 关掉就退回系统 DNS，必然泄露；必须是 true
   enable: true
+  # 节点与直连 CDN 都有 AAAA，关掉会清空 AAAA，v6 直连收益全丢
   ipv6: true
+  # 官方文档：不建议与 respect-rules 合用（h3 会绕出额外连接路径）
+  prefer-h3: false
   enhanced-mode: fake-ip
+  # 198.18.0.0/15 是基准测试保留段：不与局域网、hosts、节点公网 IP 冲突
   fake-ip-range: 198.18.0.1/16
-  # 节点自己的域名不进 fake-ip，保证刷新订阅/API 拿真实 IP
-  fake-ip-filter:
-    - "+.sslip.io"
-    - "+.lan"
-    - "+.local"
-    - "*.msftconnecttest.com"
-    - "*.msftncsi.com"
+  fake-ip-filter-mode: blacklist
+  # 关键开关：mihomo 自己发出的 DNS 查询也走 rules 判据
+  #   境内 DoH 的连接被判 DIRECT，境外 DoH 的连接被判 MATCH → 🚀 节点选择，
+  #   所以境外查询的源 IP 就是落地节点，符合「查询来源=落地地区」。
+  # 约束：仅当 proxy-server-nameserver 不为空时才能开启
+  respect-rules: true
+
+  # ① 引导解析器：唯一用途是解析「写成域名的 DoH 主机名」。
+  #    本配置四类上游全是 IP 字面量，实际不会触发；保留以守「不出明文 53」：
+  #    即便触发，也是 IP:853 的 DoT，而不是 UDP 53。
   default-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-  nameserver:
+    - tls://223.5.5.5:853
+    - tls://1.12.12.12:853
+
+  # ② 节点服务器域名专用：境内 + 直连 + 永不进代理（防「解析节点域名→走代理」回环）
+  #    本订阅 4 条节点全是字面 IP，正常走不到这里；换域名节点时靠它兜。
+  proxy-server-nameserver:
     - https://223.5.5.5/dns-query
-    - https://doh.pub/dns-query
-  nameserver-policy:
-    "+.sslip.io": "223.5.5.5"
-  fallback:
-    - https://8.8.8.8/dns-query
+    - https://1.12.12.12/dns-query
+
+  # ③ 默认解析器 = 「最终走 PROXY 的域名」用的：境外 DoH。
+  #    连接本身由 respect-rules 判到 🚀 节点选择，因此查询出口 = 落地节点。
+  #    （fake-ip 模式下这类域名绝大多数根本不在本地解析，域名原样交给出口，
+  #     这条是「需要本地出结果时」的确定性去向，不是兜底猜测。）
+  nameserver:
     - https://1.1.1.1/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
+    - https://8.8.8.8/dns-query
+
+  # ④ 与③配对：最终走 DIRECT 的域名用境内 DoH，保证就近 CDN。
+  #    机制是「先定路由，再定解析器」：mihomo 先对连接给出 DIRECT/PROXY 判决，
+  #    解析阶段 DIRECT 侧走 direct-nameserver、其它走 nameserver。
+  #    因此不需要、也不使用「域名在不在 geosite:cn」这种名单判据：
+  #    自建服务 / 自定 DOMAIN-SUFFIX / 私网段只要路由判 DIRECT，就一定用境内解析。
+  direct-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+  # 让下面的 nameserver-policy（只放特例）优先于 direct-nameserver
+  direct-nameserver-follow-policy: true
+
+  # ⑤ nameserver-policy 只承担两类「特例」，不放域名大名单（大名单替代不了④）：
+  #    ① 内网/保留域 → 系统解析器：公网 DoH 解析不了 nas.lan
+  #       若系统 DNS 指向 mihomo 自己的 TUN 监听会成环，此时请换成 dhcp://<网卡>（如 dhcp://en0）
+  #    ② 订阅域名 → 境内 DoH：避免境外 DoH 按美国就近返回被墙的 v4
+  nameserver-policy:
+    "*.lan,+.lan,*.local,+.local,localhost,*.localhost,+.home.arpa": system
+    "+.sslip.io":
+      - https://223.5.5.5/dns-query
+      - https://1.12.12.12/dns-query
+
+  # fake-ip-filter（blacklist）：命中的域名返回真实解析结果，不分配 fake-ip
+  fake-ip-filter:
+    # 节点订阅域名：要拿真实 IP 去拉订阅；节点本身是字面 IP，不会被 fake-ip
+    - "+.sslip.io"
+    # 本地域：fake-ip 会直接弄死 NAS / 路由器后台 / mDNS 名字
+    - "*.lan"
+    - "+.lan"
+    - "*.local"
+    - "+.local"
+    - "localhost"
+    - "*.localhost"
+    - "localhost.ptlogin2.qq.com"
+    # 联网探测（Captive Portal）：必须真实解析，否则系统永远认为「无网络」
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "connectivitycheck.gstatic.com"
+    - "captive.apple.com"
+    - "*.qualcomm.com"
+    # STUN：WebRTC / 游戏语音要真实 IP 才能打洞，fake-ip 直接打不通
+    - "stun.*.*"
+    - "stun.*.*.*"
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    # 时间同步：NTP 域名落到 fake-ip 会让时间同步失败（HTTPS 证书全炸）
+    - "time.*.com"
+    - "time.*.gov"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+    - "time1.cloud.tencent.com"
 
 proxies:
-  # ═══ 变量区：以下“←”行是唯一需要修改的地方 ═══
+  # ═══ 变量区：以下带 "←" 的行是唯一需要修改的取值 ═══
+  - name: "VPS-Reality-v4"
+    type: vless
+    server: &server_v4 "198.51.100.10"             # ← VPS IPv4
+    port: &port_reality 443                        # ← Reality 端口
+    uuid: &vless_uuid "00000000-0000-0000-0000-000000000000"   # ← VLESS UUID
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: &sni_reality "www.microsoft.com"   # ← 伪装 SNI
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: &reality_public_key "CHANGE_ME"  # ← Reality 公钥
+      short-id: &reality_short_id "CHANGE_ME"      # ← Reality short-id
+
   - name: "VPS-Hysteria2-v4"
     type: hysteria2
-    server: &server_v4 "198.51.100.10"            # ← VPS IPv4
-    port: &port_hy2 8443                          # ← Hysteria2 端口
-    password: &hy2_password "CHANGE_ME"           # ← Hysteria2 密码
-    sni: &sni_hy2 "www.bing.com"                  # ← 伪装域名
+    server: *server_v4
+    port: &port_hy2 8443                           # ← Hysteria2 端口
+    password: &hy2_password "CHANGE_ME"            # ← Hysteria2 密码
+    sni: &sni_hy2 "www.bing.com"                   # ← 伪装域名
     alpn:
       - h3
     skip-cert-verify: true
     up: &hy2_up "100 Mbps"
     down: &hy2_down "500 Mbps"
 
-  - name: "VPS-Reality-v4"
-    type: vless
-    server: *server_v4
-    port: &port_reality 443                       # ← Reality 端口
-    uuid: &vless_uuid "00000000-0000-0000-0000-000000000000"  # ← VLESS UUID
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: &sni_reality "www.microsoft.com"  # ← 伪装 SNI
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: &reality_public_key "CHANGE_ME" # ← Reality 公钥
-      short-id: &reality_short_id "CHANGE_ME"     # ← Reality short-id
-
-  - name: "VPS-v6-Hysteria2"
-    type: hysteria2
-    server: &server_v6 "2001:db8::10"             # ← VPS IPv6
-    port: *port_hy2
-    password: *hy2_password
-    sni: *sni_hy2
-    alpn:
-      - h3
-    skip-cert-verify: true
-    up: *hy2_up
-    down: *hy2_down
-
   - name: "VPS-v6-Reality"
     type: vless
-    server: *server_v6
+    server: &server_v6 "2001:db8::10"              # ← VPS IPv6
     port: *port_reality
     uuid: *vless_uuid
     network: tcp
@@ -108,29 +175,42 @@ proxies:
       public-key: *reality_public_key
       short-id: *reality_short_id
 
-proxy-groups:
-  # 测速池：四条（v4/v6 × Hysteria2/Reality）一起测，谁通用谁。
-  # 某地址族不可达时对应节点一直超时，url-test 自动把它排除在外。
-  - name: "♻️ 自动选择"
-    type: url-test
-    url: https://www.gstatic.com/generate_204
-    interval: 180
-    tolerance: 50
-    lazy: false
-    proxies: ["VPS-Hysteria2-v4", "VPS-Reality-v4", "VPS-v6-Hysteria2", "VPS-v6-Reality"]
+  - name: "VPS-v6-Hysteria2"
+    type: hysteria2
+    server: *server_v6
+    port: *port_hy2
+    password: *hy2_password
+    sni: *sni_hy2
+    alpn:
+      - h3
+    skip-cert-verify: true
+    up: *hy2_up
+    down: *hy2_down
 
-  # 故障转移：按 v6 在前的固定顺序取第一条可用节点。
-  # 部分线路到 v4 入站可能被单向丢弃，v6 通常是稳定路径；
-  # v4 恢复后无需改动，它只在前两条都不可用时才被选中。
-  - name: "🔁 故障转移(v6 优先)"
+proxy-groups:
+  # v4 两条按「Reality → Hy2」固定顺序 fallback：当前这条健康就一直用，
+  # 测不通才换下一条，不会像 url-test 那样按延迟来回跳。
+  # 面板里手动点某条会写进 store-selected，之后只在它失效时才被换掉。
+  - name: "🔁 v4(Reality 优先)"
     type: fallback
     url: https://www.gstatic.com/generate_204
     interval: 180
-    proxies: ["VPS-v6-Reality", "VPS-v6-Hysteria2", "VPS-Reality-v4", "VPS-Hysteria2-v4"]
+    proxies: ["VPS-Reality-v4", "VPS-Hysteria2-v4"]
 
+  # v6 两条同型，顺序同为 Reality → Hy2。
+  - name: "🔁 v6(Reality 优先)"
+    type: fallback
+    url: https://www.gstatic.com/generate_204
+    interval: 180
+    proxies: ["VPS-v6-Reality", "VPS-v6-Hysteria2"]
+
+  # 顶层三选一：v4 组 / v6 组 / DIRECT，规则集里所有代理规则都指向这里。
+  # 默认选中 v6 组；若你的线路 v6 不通而 v4 正常，把 default-selected 改成 v4 组。
+  # 已有客户端沿用自己 store-selected 的选择，不受默认值影响。
   - name: "🚀 节点选择"
     type: select
-    proxies: ["♻️ 自动选择", "🔁 故障转移(v6 优先)", "VPS-Hysteria2-v4", "VPS-Reality-v4", "VPS-v6-Hysteria2", "VPS-v6-Reality", "DIRECT"]
+    default-selected: "🔁 v6(Reality 优先)"
+    proxies: ["🔁 v4(Reality 优先)", "🔁 v6(Reality 优先)", "DIRECT"]
 
   # 广告域名默认拦截；确认误杀时可整组切到 DIRECT 放行
   - name: "🛑 拦截广告"
@@ -141,7 +221,18 @@ rules:
   # 节点自身地址直连，避免自己绕回代理（迁移时同步成新的 VPS 地址）
   - IP-CIDR,198.51.100.10/32,DIRECT,no-resolve
   - IP-CIDR6,2001:db8::10/128,DIRECT,no-resolve
+  # 自托管订阅与 geoip 镜像域名固定直连
   - DOMAIN-SUFFIX,sslip.io,DIRECT
+  # DNS 上游本身必须直连，否则 respect-rules 会让 DNS 查询绕进代理
+  - IP-CIDR,223.5.5.5/32,DIRECT,no-resolve
+  - IP-CIDR,1.12.12.12/32,DIRECT,no-resolve
+  # 内网/保留域：必须判 DIRECT，否则会落到域名 catch-all → 走代理，
+  # 而公网 DoH 又解析不了不存在的名字（dns.nameserver-policy 里配的是系统解析器）
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - DOMAIN-SUFFIX,localhost,DIRECT
+  - DOMAIN-SUFFIX,home.arpa,DIRECT
+  - DOMAIN-KEYWORD,admarvel,🛑 拦截广告
   - DOMAIN-KEYWORD,admaster,🛑 拦截广告
   - DOMAIN-KEYWORD,adsage,🛑 拦截广告
   - DOMAIN-KEYWORD,adsensor,🛑 拦截广告
@@ -9111,259 +9202,259 @@ rules:
   - IP-CIDR6,fe80::/10,DIRECT,no-resolve
   - IP-CIDR6,fd00::/8,DIRECT,no-resolve
   - IP-CIDR,224.0.0.0/4,REJECT,no-resolve
-  - IP-CIDR,173.245.48.0/20,🚀 节点选择
-  - IP-CIDR,103.21.244.0/22,🚀 节点选择
-  - IP-CIDR,103.22.200.0/22,🚀 节点选择
-  - IP-CIDR,103.31.4.0/22,🚀 节点选择
-  - IP-CIDR,141.101.64.0/18,🚀 节点选择
-  - IP-CIDR,108.162.192.0/18,🚀 节点选择
-  - IP-CIDR,190.93.240.0/20,🚀 节点选择
-  - IP-CIDR,188.114.96.0/20,🚀 节点选择
-  - IP-CIDR,197.234.240.0/22,🚀 节点选择
-  - IP-CIDR,198.41.128.0/17,🚀 节点选择
-  - IP-CIDR,162.158.0.0/15,🚀 节点选择
-  - IP-CIDR,104.16.0.0/13,🚀 节点选择
-  - IP-CIDR,104.24.0.0/14,🚀 节点选择
-  - IP-CIDR,172.64.0.0/13,🚀 节点选择
-  - IP-CIDR,131.0.72.0/22,🚀 节点选择
-  - IP-CIDR,61.160.148.90/32,🚀 节点选择
-  - IP-CIDR,221.228.32.13/32,🚀 节点选择
-  - IP-CIDR,106.74.25.198/32,🚀 节点选择
-  - IP-CIDR,183.192.65.101/32,🚀 节点选择
-  - IP-CIDR,124.236.16.201/32,🚀 节点选择
-  - IP-CIDR,182.43.124.6/32,🚀 节点选择
-  - IP-CIDR,4.78.139.0/24,🚀 节点选择
-  - IP-CIDR,8.7.198.0/24,🚀 节点选择
-  - IP-CIDR,11.45.1.0/24,🚀 节点选择
-  - IP-CIDR,23.101.24.0/24,🚀 节点选择
-  - IP-CIDR,23.225.141.0/24,🚀 节点选择
-  - IP-CIDR,23.234.30.0/24,🚀 节点选择
-  - IP-CIDR,31.13.64.0/20,🚀 节点选择
-  - IP-CIDR,31.13.80.0/21,🚀 节点选择
-  - IP-CIDR,31.13.88.0/24,🚀 节点选择
-  - IP-CIDR,31.13.90.0/23,🚀 节点选择
-  - IP-CIDR,31.13.92.0/22,🚀 节点选择
-  - IP-CIDR,31.13.96.0/23,🚀 节点选择
-  - IP-CIDR,31.13.106.0/24,🚀 节点选择
-  - IP-CIDR,31.13.112.0/24,🚀 节点选择
-  - IP-CIDR,38.121.72.0/24,🚀 节点选择
-  - IP-CIDR,39.109.122.0/24,🚀 节点选择
-  - IP-CIDR,43.226.16.0/24,🚀 节点选择
-  - IP-CIDR,45.77.186.0/24,🚀 节点选择
-  - IP-CIDR,45.114.11.0/24,🚀 节点选择
-  - IP-CIDR,46.82.174.0/24,🚀 节点选择
-  - IP-CIDR,47.88.58.0/24,🚀 节点选择
-  - IP-CIDR,50.23.209.0/24,🚀 节点选择
-  - IP-CIDR,50.87.93.0/24,🚀 节点选择
-  - IP-CIDR,50.117.117.0/24,🚀 节点选择
-  - IP-CIDR,52.58.1.0/24,🚀 节点选择
-  - IP-CIDR,52.175.9.0/24,🚀 节点选择
-  - IP-CIDR,54.89.135.0/24,🚀 节点选择
-  - IP-CIDR,54.234.18.0/24,🚀 节点选择
-  - IP-CIDR,54.245.22.0/24,🚀 节点选择
-  - IP-CIDR,59.24.3.0/24,🚀 节点选择
-  - IP-CIDR,59.188.250.0/24,🚀 节点选择
-  - IP-CIDR,64.13.192.0/24,🚀 节点选择
-  - IP-CIDR,64.13.232.0/24,🚀 节点选择
-  - IP-CIDR,65.49.26.0/24,🚀 节点选择
-  - IP-CIDR,65.49.68.0/24,🚀 节点选择
-  - IP-CIDR,66.220.146.0/23,🚀 节点选择
-  - IP-CIDR,66.220.148.0/23,🚀 节点选择
-  - IP-CIDR,66.220.151.0/24,🚀 节点选择
-  - IP-CIDR,66.220.152.0/24,🚀 节点选择
-  - IP-CIDR,66.220.155.0/24,🚀 节点选择
-  - IP-CIDR,66.220.158.0/24,🚀 节点选择
-  - IP-CIDR,67.15.100.0/24,🚀 节点选择
-  - IP-CIDR,67.15.129.0/24,🚀 节点选择
-  - IP-CIDR,67.228.102.0/24,🚀 节点选择
-  - IP-CIDR,67.228.235.0/24,🚀 节点选择
-  - IP-CIDR,67.230.169.0/24,🚀 节点选择
-  - IP-CIDR,69.30.25.0/24,🚀 节点选择
-  - IP-CIDR,69.50.221.0/24,🚀 节点选择
-  - IP-CIDR,69.63.176.0/24,🚀 节点选择
-  - IP-CIDR,69.63.178.0/24,🚀 节点选择
-  - IP-CIDR,69.63.180.0/23,🚀 节点选择
-  - IP-CIDR,69.63.184.0/24,🚀 节点选择
-  - IP-CIDR,69.63.186.0/23,🚀 节点选择
-  - IP-CIDR,69.63.189.0/24,🚀 节点选择
-  - IP-CIDR,69.63.190.0/24,🚀 节点选择
-  - IP-CIDR,69.162.134.0/24,🚀 节点选择
-  - IP-CIDR,69.171.224.0/23,🚀 节点选择
-  - IP-CIDR,69.171.227.0/24,🚀 节点选择
-  - IP-CIDR,69.171.228.0/23,🚀 节点选择
-  - IP-CIDR,69.171.230.0/24,🚀 节点选择
-  - IP-CIDR,69.171.232.0/22,🚀 节点选择
-  - IP-CIDR,69.171.237.0/24,🚀 节点选择
-  - IP-CIDR,69.171.239.0/24,🚀 节点选择
-  - IP-CIDR,69.171.242.0/24,🚀 节点选择
-  - IP-CIDR,69.171.244.0/22,🚀 节点选择
-  - IP-CIDR,69.171.248.0/24,🚀 节点选择
-  - IP-CIDR,69.197.153.0/24,🚀 节点选择
-  - IP-CIDR,74.86.3.0/24,🚀 节点选择
-  - IP-CIDR,74.86.12.0/24,🚀 节点选择
-  - IP-CIDR,74.86.17.0/24,🚀 节点选择
-  - IP-CIDR,74.86.118.0/24,🚀 节点选择
-  - IP-CIDR,74.86.142.0/24,🚀 节点选择
-  - IP-CIDR,74.86.151.0/24,🚀 节点选择
-  - IP-CIDR,74.86.226.0/24,🚀 节点选择
-  - IP-CIDR,74.86.228.0/24,🚀 节点选择
-  - IP-CIDR,75.126.2.0/24,🚀 节点选择
-  - IP-CIDR,75.126.33.0/24,🚀 节点选择
-  - IP-CIDR,75.126.115.0/24,🚀 节点选择
-  - IP-CIDR,75.126.124.0/24,🚀 节点选择
-  - IP-CIDR,75.126.135.0/24,🚀 节点选择
-  - IP-CIDR,75.126.150.0/24,🚀 节点选择
-  - IP-CIDR,75.126.164.0/24,🚀 节点选择
-  - IP-CIDR,75.126.215.0/24,🚀 节点选择
-  - IP-CIDR,78.16.49.0/24,🚀 节点选择
-  - IP-CIDR,80.87.199.0/24,🚀 节点选择
-  - IP-CIDR,88.191.249.0/24,🚀 节点选择
-  - IP-CIDR,88.191.253.0/24,🚀 节点选择
-  - IP-CIDR,93.46.8.0/24,🚀 节点选择
-  - IP-CIDR,93.179.102.0/24,🚀 节点选择
-  - IP-CIDR,96.44.137.0/24,🚀 节点选择
-  - IP-CIDR,98.159.108.0/24,🚀 节点选择
-  - IP-CIDR,103.39.76.0/24,🚀 节点选择
-  - IP-CIDR,103.42.176.0/24,🚀 节点选择
-  - IP-CIDR,103.56.16.0/24,🚀 节点选择
-  - IP-CIDR,103.73.161.0/24,🚀 节点选择
-  - IP-CIDR,103.97.3.0/24,🚀 节点选择
-  - IP-CIDR,103.97.176.0/24,🚀 节点选择
-  - IP-CIDR,103.200.30.0/23,🚀 节点选择
-  - IP-CIDR,103.214.168.0/24,🚀 节点选择
-  - IP-CIDR,103.223.122.0/24,🚀 节点选择
-  - IP-CIDR,103.226.246.0/24,🚀 节点选择
-  - IP-CIDR,103.228.130.0/24,🚀 节点选择
-  - IP-CIDR,103.230.123.0/24,🚀 节点选择
-  - IP-CIDR,103.240.180.0/24,🚀 节点选择
-  - IP-CIDR,103.240.182.0/24,🚀 节点选择
-  - IP-CIDR,103.246.246.0/24,🚀 节点选择
-  - IP-CIDR,103.252.114.0/23,🚀 节点选择
-  - IP-CIDR,104.16.251.0/24,🚀 节点选择
-  - IP-CIDR,104.16.252.0/24,🚀 节点选择
-  - IP-CIDR,104.23.124.0/23,🚀 节点选择
-  - IP-CIDR,104.31.142.0/23,🚀 节点选择
-  - IP-CIDR,104.244.42.0/23,🚀 节点选择
-  - IP-CIDR,104.244.45.0/24,🚀 节点选择
-  - IP-CIDR,104.244.46.0/24,🚀 节点选择
-  - IP-CIDR,107.181.166.0/24,🚀 节点选择
-  - IP-CIDR,108.160.161.0/24,🚀 节点选择
-  - IP-CIDR,108.160.162.0/23,🚀 节点选择
-  - IP-CIDR,108.160.165.0/24,🚀 节点选择
-  - IP-CIDR,108.160.166.0/23,🚀 节点选择
-  - IP-CIDR,108.160.169.0/24,🚀 节点选择
-  - IP-CIDR,108.160.170.0/24,🚀 节点选择
-  - IP-CIDR,108.160.172.0/23,🚀 节点选择
-  - IP-CIDR,111.243.214.0/24,🚀 节点选择
-  - IP-CIDR,114.43.24.0/24,🚀 节点选择
-  - IP-CIDR,115.126.100.0/24,🚀 节点选择
-  - IP-CIDR,116.89.243.0/24,🚀 节点选择
-  - IP-CIDR,118.107.180.0/24,🚀 节点选择
-  - IP-CIDR,118.184.26.0/24,🚀 节点选择
-  - IP-CIDR,118.184.78.0/24,🚀 节点选择
-  - IP-CIDR,118.193.202.0/24,🚀 节点选择
-  - IP-CIDR,118.193.240.0/24,🚀 节点选择
-  - IP-CIDR,119.28.87.0/24,🚀 节点选择
-  - IP-CIDR,122.10.85.0/24,🚀 节点选择
-  - IP-CIDR,122.248.226.0/24,🚀 节点选择
-  - IP-CIDR,124.11.210.0/24,🚀 节点选择
-  - IP-CIDR,128.121.146.0/24,🚀 节点选择
-  - IP-CIDR,128.121.243.0/24,🚀 节点选择
-  - IP-CIDR,128.242.240.0/24,🚀 节点选择
-  - IP-CIDR,128.242.245.0/24,🚀 节点选择
-  - IP-CIDR,128.242.250.0/24,🚀 节点选择
-  - IP-CIDR,130.211.15.0/24,🚀 节点选择
-  - IP-CIDR,147.75.95.0/24,🚀 节点选择
-  - IP-CIDR,148.163.48.0/24,🚀 节点选择
-  - IP-CIDR,150.107.3.0/24,🚀 节点选择
-  - IP-CIDR,151.101.77.0/24,🚀 节点选择
-  - IP-CIDR,154.83.14.0/23,🚀 节点选择
-  - IP-CIDR,154.85.102.0/24,🚀 节点选择
-  - IP-CIDR,154.92.16.0/24,🚀 节点选择
-  - IP-CIDR,156.233.67.0/24,🚀 节点选择
-  - IP-CIDR,157.240.0.0/22,🚀 节点选择
-  - IP-CIDR,157.240.6.0/23,🚀 节点选择
-  - IP-CIDR,157.240.8.0/22,🚀 节点选择
-  - IP-CIDR,157.240.12.0/23,🚀 节点选择
-  - IP-CIDR,157.240.15.0/24,🚀 节点选择
-  - IP-CIDR,157.240.16.0/23,🚀 节点选择
-  - IP-CIDR,157.240.18.0/24,🚀 节点选择
-  - IP-CIDR,157.240.20.0/23,🚀 节点选择
-  - IP-CIDR,159.65.107.0/24,🚀 节点选择
-  - IP-CIDR,159.106.121.0/24,🚀 节点选择
-  - IP-CIDR,159.138.20.0/24,🚀 节点选择
-  - IP-CIDR,162.125.1.0/24,🚀 节点选择
-  - IP-CIDR,162.125.2.0/24,🚀 节点选择
-  - IP-CIDR,162.125.6.0/23,🚀 节点选择
-  - IP-CIDR,162.125.8.0/24,🚀 节点选择
-  - IP-CIDR,162.125.17.0/24,🚀 节点选择
-  - IP-CIDR,162.125.18.0/24,🚀 节点选择
-  - IP-CIDR,162.125.32.0/24,🚀 节点选择
-  - IP-CIDR,162.125.34.0/24,🚀 节点选择
-  - IP-CIDR,162.125.80.0/24,🚀 节点选择
-  - IP-CIDR,162.125.82.0/23,🚀 节点选择
-  - IP-CIDR,162.220.12.0/24,🚀 节点选择
-  - IP-CIDR,168.143.162.0/24,🚀 节点选择
-  - IP-CIDR,168.143.171.0/24,🚀 节点选择
-  - IP-CIDR,173.208.182.0/24,🚀 节点选择
-  - IP-CIDR,173.231.12.0/24,🚀 节点选择
-  - IP-CIDR,173.234.53.0/24,🚀 节点选择
-  - IP-CIDR,173.236.182.0/24,🚀 节点选择
-  - IP-CIDR,173.236.212.0/24,🚀 节点选择
-  - IP-CIDR,173.244.209.0/24,🚀 节点选择
-  - IP-CIDR,173.244.217.0/24,🚀 节点选择
-  - IP-CIDR,173.252.73.0/24,🚀 节点选择
-  - IP-CIDR,173.252.88.0/24,🚀 节点选择
-  - IP-CIDR,173.252.100.0/24,🚀 节点选择
-  - IP-CIDR,173.252.102.0/23,🚀 节点选择
-  - IP-CIDR,173.252.105.0/24,🚀 节点选择
-  - IP-CIDR,173.252.108.0/24,🚀 节点选择
-  - IP-CIDR,173.252.110.0/24,🚀 节点选择
-  - IP-CIDR,173.252.248.0/24,🚀 节点选择
-  - IP-CIDR,173.255.209.0/24,🚀 节点选择
-  - IP-CIDR,173.255.213.0/24,🚀 节点选择
-  - IP-CIDR,174.36.196.0/24,🚀 节点选择
-  - IP-CIDR,174.36.228.0/24,🚀 节点选择
-  - IP-CIDR,174.37.54.0/24,🚀 节点选择
-  - IP-CIDR,174.37.154.0/24,🚀 节点选择
-  - IP-CIDR,174.37.175.0/24,🚀 节点选择
-  - IP-CIDR,174.37.243.0/24,🚀 节点选择
-  - IP-CIDR,179.60.193.0/24,🚀 节点选择
-  - IP-CIDR,182.50.139.0/24,🚀 节点选择
-  - IP-CIDR,184.72.1.0/24,🚀 节点选择
-  - IP-CIDR,184.173.136.0/24,🚀 节点选择
-  - IP-CIDR,185.45.6.0/23,🚀 节点选择
-  - IP-CIDR,185.60.216.0/24,🚀 节点选择
-  - IP-CIDR,185.60.218.0/23,🚀 节点选择
-  - IP-CIDR,192.133.77.0/24,🚀 节点选择
-  - IP-CIDR,198.27.124.0/24,🚀 节点选择
-  - IP-CIDR,198.44.185.0/24,🚀 节点选择
-  - IP-CIDR,199.16.156.0/24,🚀 节点选择
-  - IP-CIDR,199.16.158.0/24,🚀 节点选择
-  - IP-CIDR,199.59.148.0/23,🚀 节点选择
-  - IP-CIDR,199.59.150.0/24,🚀 节点选择
-  - IP-CIDR,199.96.58.0/23,🚀 节点选择
-  - IP-CIDR,199.96.61.0/24,🚀 节点选择
-  - IP-CIDR,199.96.62.0/23,🚀 节点选择
-  - IP-CIDR,199.193.116.0/24,🚀 节点选择
-  - IP-CIDR,202.53.137.0/24,🚀 节点选择
-  - IP-CIDR,202.160.128.0/23,🚀 节点选择
-  - IP-CIDR,202.160.130.0/24,🚀 节点选择
-  - IP-CIDR,202.182.98.0/24,🚀 节点选择
-  - IP-CIDR,203.111.254.0/24,🚀 节点选择
-  - IP-CIDR,204.79.197.0/24,🚀 节点选择
-  - IP-CIDR,205.186.152.0/24,🚀 节点选择
-  - IP-CIDR,208.31.254.0/24,🚀 节点选择
-  - IP-CIDR,208.43.170.0/24,🚀 节点选择
-  - IP-CIDR,208.43.237.0/24,🚀 节点选择
-  - IP-CIDR,208.77.47.0/24,🚀 节点选择
-  - IP-CIDR,208.101.21.0/24,🚀 节点选择
-  - IP-CIDR,208.101.60.0/24,🚀 节点选择
-  - IP-CIDR,209.95.56.0/24,🚀 节点选择
-  - IP-CIDR,210.56.51.0/24,🚀 节点选择
-  - IP-CIDR,210.209.84.0/24,🚀 节点选择
-  - IP-CIDR,211.104.160.0/24,🚀 节点选择
-  - IP-CIDR,243.185.187.0/24,🚀 节点选择
+  - IP-CIDR,173.245.48.0/20,🚀 节点选择,no-resolve
+  - IP-CIDR,103.21.244.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,103.22.200.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,103.31.4.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,141.101.64.0/18,🚀 节点选择,no-resolve
+  - IP-CIDR,108.162.192.0/18,🚀 节点选择,no-resolve
+  - IP-CIDR,190.93.240.0/20,🚀 节点选择,no-resolve
+  - IP-CIDR,188.114.96.0/20,🚀 节点选择,no-resolve
+  - IP-CIDR,197.234.240.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,198.41.128.0/17,🚀 节点选择,no-resolve
+  - IP-CIDR,162.158.0.0/15,🚀 节点选择,no-resolve
+  - IP-CIDR,104.16.0.0/13,🚀 节点选择,no-resolve
+  - IP-CIDR,104.24.0.0/14,🚀 节点选择,no-resolve
+  - IP-CIDR,172.64.0.0/13,🚀 节点选择,no-resolve
+  - IP-CIDR,131.0.72.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,61.160.148.90/32,🚀 节点选择,no-resolve
+  - IP-CIDR,221.228.32.13/32,🚀 节点选择,no-resolve
+  - IP-CIDR,106.74.25.198/32,🚀 节点选择,no-resolve
+  - IP-CIDR,183.192.65.101/32,🚀 节点选择,no-resolve
+  - IP-CIDR,124.236.16.201/32,🚀 节点选择,no-resolve
+  - IP-CIDR,182.43.124.6/32,🚀 节点选择,no-resolve
+  - IP-CIDR,4.78.139.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,8.7.198.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,11.45.1.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,23.101.24.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,23.225.141.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,23.234.30.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.64.0/20,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.80.0/21,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.88.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.90.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.92.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.96.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.106.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,31.13.112.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,38.121.72.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,39.109.122.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,43.226.16.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,45.77.186.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,45.114.11.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,46.82.174.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,47.88.58.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,50.23.209.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,50.87.93.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,50.117.117.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,52.58.1.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,52.175.9.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,54.89.135.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,54.234.18.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,54.245.22.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,59.24.3.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,59.188.250.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,64.13.192.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,64.13.232.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,65.49.26.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,65.49.68.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.146.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.148.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.151.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.152.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.155.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,66.220.158.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,67.15.100.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,67.15.129.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,67.228.102.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,67.228.235.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,67.230.169.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.30.25.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.50.221.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.176.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.178.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.180.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.184.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.186.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.189.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.63.190.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.162.134.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.224.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.227.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.228.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.230.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.232.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.237.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.239.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.242.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.244.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,69.171.248.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,69.197.153.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.3.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.12.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.17.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.118.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.142.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.151.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.226.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,74.86.228.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.2.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.33.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.115.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.124.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.135.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.150.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.164.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,75.126.215.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,78.16.49.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,80.87.199.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,88.191.249.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,88.191.253.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,93.46.8.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,93.179.102.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,96.44.137.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,98.159.108.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.39.76.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.42.176.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.56.16.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.73.161.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.97.3.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.97.176.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.200.30.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,103.214.168.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.223.122.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.226.246.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.228.130.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.230.123.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.240.180.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.240.182.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.246.246.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,103.252.114.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,104.16.251.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,104.16.252.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,104.23.124.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,104.31.142.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,104.244.42.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,104.244.45.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,104.244.46.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,107.181.166.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.161.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.162.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.165.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.166.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.169.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.170.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,108.160.172.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,111.243.214.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,114.43.24.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,115.126.100.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,116.89.243.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,118.107.180.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,118.184.26.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,118.184.78.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,118.193.202.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,118.193.240.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,119.28.87.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,122.10.85.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,122.248.226.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,124.11.210.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,128.121.146.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,128.121.243.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,128.242.240.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,128.242.245.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,128.242.250.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,130.211.15.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,147.75.95.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,148.163.48.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,150.107.3.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,151.101.77.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,154.83.14.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,154.85.102.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,154.92.16.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,156.233.67.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.0.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.6.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.8.0/22,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.12.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.15.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.16.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.18.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,157.240.20.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,159.65.107.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,159.106.121.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,159.138.20.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.1.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.2.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.6.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.8.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.17.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.18.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.32.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.34.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.80.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,162.125.82.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,162.220.12.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,168.143.162.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,168.143.171.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.208.182.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.231.12.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.234.53.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.236.182.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.236.212.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.244.209.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.244.217.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.73.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.88.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.100.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.102.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.105.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.108.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.110.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.252.248.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.255.209.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,173.255.213.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.36.196.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.36.228.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.37.54.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.37.154.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.37.175.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,174.37.243.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,179.60.193.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,182.50.139.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,184.72.1.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,184.173.136.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,185.45.6.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,185.60.216.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,185.60.218.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,192.133.77.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,198.27.124.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,198.44.185.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,199.16.156.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,199.16.158.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,199.59.148.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,199.59.150.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,199.96.58.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,199.96.61.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,199.96.62.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,199.193.116.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,202.53.137.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,202.160.128.0/23,🚀 节点选择,no-resolve
+  - IP-CIDR,202.160.130.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,202.182.98.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,203.111.254.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,204.79.197.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,205.186.152.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.31.254.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.43.170.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.43.237.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.77.47.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.101.21.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,208.101.60.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,209.95.56.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,210.56.51.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,210.209.84.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,211.104.160.0/24,🚀 节点选择,no-resolve
+  - IP-CIDR,243.185.187.0/24,🚀 节点选择,no-resolve
   - DOMAIN-SUFFIX,cn.pool.ntp.org,DIRECT
   - DOMAIN-SUFFIX,mcc460.pub.3gppnetwork.org,DIRECT
   - DOMAIN-SUFFIX,p-bstarstatic.akamaized.net,DIRECT
@@ -13382,7 +13473,6 @@ rules:
   - DOMAIN-SUFFIX,tibet3.com,DIRECT
   - DOMAIN-SUFFIX,atomgit.com,DIRECT
   - DOMAIN-SUFFIX,vgabc.com,DIRECT
-  - GEOIP,CN,DIRECT
   - DOMAIN-SUFFIX,eu,🚀 节点选择
   - DOMAIN-SUFFIX,hk,🚀 节点选择
   - DOMAIN-SUFFIX,jp,🚀 节点选择
@@ -13394,4 +13484,5 @@ rules:
   - DOMAIN-SUFFIX,ca,🚀 节点选择
   - DOMAIN-SUFFIX,cn,DIRECT
   - DOMAIN-KEYWORD,.,🚀 节点选择
+  - GEOIP,CN,DIRECT
   - MATCH,🚀 节点选择
